@@ -19,8 +19,9 @@ git clone https://github.com/MedARC-AI/nanopath.git && cd nanopath
 uv sync && source .venv/bin/activate
 wandb login  # or: export WANDB_MODE=offline before launching noninteractive SLURM jobs
 
-# download pretraining & probe datasets & DINOv2 pretrained ckpt
-python prepare.py download=True
+# Set data.dataset_dir in both configs to prepared Arrow shards.
+# See "Regenerating the tile dataset from raw SVS" for data creation.
+python prepare.py download=True  # verify tiles, download probes and weights
 
 # smoke test: very short training, then probe evals to ensure no errors
 ./submit/train_1gpu.sbatch configs/smoke.yaml
@@ -190,19 +191,52 @@ The script reads `summary.json` and `metrics.jsonl`, reviews `output_dir/labless
 On the MedARC cluster, the checked-in `/data` paths are the intended shared defaults and existing populated roots are reused. On a machine without writable `/data` or `/block` mounts, `download=True` rewrites the checked-in main and smoke configs to ignored repo-local `data/` roots before downloading.
 
 **What `download=True` does**
-1. **TCGA tiles**: `huggingface_hub.snapshot_download` (filtered to `shard-*.parquet`) pulls the 200 parquet shards (~120 GB total, `{path: string, jpeg: binary}` rows with 64-row row groups) from [`medarc/nanopath`](https://huggingface.co/datasets/medarc/nanopath) into `data.dataset_dir`. The JEPA/FINO recipes also fetch patient metadata into this directory.
+
+1. **TCGA tiles**: `data.dataset_dir` must contain 200 prepared Arrow shards (~120 GB). Tile creation writes this format directly. The existing [`medarc/nanopath`](https://huggingface.co/datasets/medarc/nanopath) release contains Parquet shards, which this loader does not read.
 2. **Probe datasets**: downloads the exact evaluation snapshot from [`medarc/nanopath-evals`](https://huggingface.co/datasets/medarc/nanopath-evals) into each missing configured root, then verifies every required record.
 3. **DINOv2 backbone weights**: `torch.hub.load_state_dict_from_url` fetches the Meta checkpoint for `model.type` from `dl.fbaipublicfiles.com` into `~/.cache/torch/hub/checkpoints/`.
 
 **Prerequisites**
-- About 355 GB free for a fresh complete setup: ~120 GB of pretraining shards, ~215 GB of extracted probe data, and temporary room while the largest image archive is extracted. Existing populated roots reduce the download and space requirement.
+
+- About 335 GB for prepared data: 120 GB of Arrow tiles and 215 GB of probe data. Archive extraction needs additional temporary space. Raw-slide regeneration needs separate storage for slides and intermediate JPEGs.
 - Acceptance of each upstream benchmark dataset's original research-use terms. The MedARC mirror preserves the data needed by the protocol but does not relicense its components.
 
 Our evaluation suite only downloads a small subset of non-test data derived from [THUNDER](https://mics-lab.github.io/thunder/), [PathoBench](https://github.com/mahmoodlab/patho-bench), [LEOPARD](https://leopard.grand-challenge.org/), and [PathoROB](https://arxiv.org/abs/2507.17845). It contains no official THUNDER, HEST, or CPTAC classification test records; HEST is absent entirely, CPTAC appears only in the existing CPTAC-PDA survival development probe, PanNuke Fold3 is absent, and the unused TCGA center is removed from downloadable Tolkach ESCA. See [benchmarking/README.md](benchmarking/README.md) for the precise split contract.
 
+### Arrow tiles and cached tissue fractions
+
+The loader reads uncompressed Arrow IPC files named `shard-NNNNN.arrow`.
+Each row contains `path: string`, original `jpeg: binary` bytes, and non-null `tissue_fraction: float32`.
+Preparation writes one record batch per shard (about 20,000 tiles or 600 MB).
+The reader also supports smaller or unequal batches through cached cumulative row offsets.
+Each worker retains at most 256 readers, with one cached batch per reader.
+Mapped pages consume memory as accessed, but the loader decodes only the selected JPEG.
+
+Tissue fractions measure decoded RGB pixels with saturation greater than 0.07.
+Training rejects candidates from these fractions before reading JPEG bytes.
+The sampling order, rejection RNG, patient split, and dataset length remain unchanged.
+Validation accepts all tiles in its split.
+`data.tissue_thresh` remains adjustable without conversion.
+
+Set `data.dataset_dir` in both configs to the prepared Arrow directory.
+The checked-in configs use `/data/$USER/nanopath/nanopath_arrow`.
+`python prepare.py download=True` verifies these tiles and downloads missing probe data and model weights.
+The one-off migration of existing Parquet data is separate from this repository.
+Original datasets stay unchanged.
+
+Tile creation writes one record batch per shard.
+Each binary column must fit Arrow's 2 GiB offset limit.
+The standard shards fit this limit.
+Each completed shard replaces its destination atomically.
+
+With all performance defaults enabled, three matched H100 subset trials measured 694 → 701 training tiles/s for main Parquet → Arrow.
+The input pipeline, including transfers and GPU augmentation without a model, measured 1,098 → 1,815 tiles/s.
+These warm-cache results used 160,000 tiles, batch 128, and eight workers.
+They show more input capacity, with little change in training throughput.
+
 ### Regenerating the tile dataset from raw SVS
 
-`prepare.py` itself never touches raw SVS files—it always pulls the ready-made parquet shards from HF. If you want, however, you can download the full ~13 TB original SVS files from TCGA and pre-extract different tiles to pretrain on. Two-step workflow (decode SVS → JPEG dir + manifest, then pack into parquet shards):
+The normal `prepare.py` command verifies prepared Arrow shards. Its tile-creation functions reproduce the dataset from raw SVS files. If you want, however, you can download the full ~13 TB original SVS files from TCGA and pre-extract different tiles to pretrain on. Two-step workflow (decode SVS → JPEG dir + manifest, then pack into Arrow shards):
 
 ```bash
 # 1) Download the full 12K open-access TCGA SVS slide set (~13 TB).
@@ -213,18 +247,18 @@ bash download_TCGA.sh /data/TCGA 8
 #    dataset) and writes JPEGs + manifest.txt under jpeg_dir; reruns are
 #    resumable (existing JPEGs are EOF-validated and reused). pack_from_jpeg_dir
 #    then walks the manifest, splits into NUM_SHARDS=200 chunks, and writes
-#    shard-NNNNN.parquet files with 64-row row groups (the layout the
-#    dataloader expects). Once it's done you can rm -rf the jpeg_dir.
+#    shard-NNNNN.arrow files with one record batch per shard.
 python -c "
 from pathlib import Path
 from prepare import prepare_tiles, pack_from_jpeg_dir
 jpeg_dir = Path('/data/$USER/nanopath/nanopath_jpegs_tmp')
 prepare_tiles(Path('/data/TCGA/sample_dataset_30.txt'), jpeg_dir, split_seed=42)
-pack_from_jpeg_dir(jpeg_dir, jpeg_dir / 'manifest.txt', Path('/data/$USER/nanopath/nanopath_parquet'))
+pack_from_jpeg_dir(jpeg_dir, jpeg_dir / 'manifest.txt', Path('/data/$USER/nanopath/nanopath_arrow'))
 "
 ```
 
-Point `data.dataset_dir` at the packed parquet directory before training. To publish a new variant of the training dataset, push the resulting shards to a fresh HF dataset repo and update `HF_TRAIN_REPO_ID` in `prepare.py`.
+Packing computes tissue fractions from the saved JPEG bytes and includes the required metadata.
+Point `data.dataset_dir` in both configs at the packed Arrow directory before training.
 
 ## Running
 
@@ -262,7 +296,7 @@ uv sync --no-group simd --group pillow
 
 - run outputs: `project.output_dir` (MedARC cluster default `/data/$USER/nanopath/main/...`; auto-localized default `nanopath/data/main/...`). Final probe results log to `metrics.jsonl`.
 - wandb: `project.wandb_dir` (cluster default `/data/$USER/nanopath/wandb`; auto-localized default `nanopath/data/wandb`).
-- parquet tile shards: `data.dataset_dir` (defaults to `/data/nanopath_parquet`).
+- Arrow tile shards: `data.dataset_dir` (defaults to `/data/$USER/nanopath/nanopath_arrow`).
 - probe datasets: canonical shared `/data/thunder-data`, `/data/surgen`, `/data/leopard_bcr`, `/data/CPTAC-PDA`, `/data/pathorob`, and `/data/ucla-lung` roots declared in `probe.dataset_roots`.
 - DINOv2 backbone weights: `~/.cache/torch/hub/checkpoints/` for the selected `model.type`.
 - SLURM logs: `slurm/<jobid>.{out,err}` in the repo.
