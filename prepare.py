@@ -3,8 +3,8 @@
 #   - data.dataset_dir/shard-NNNNN.arrow   (the 4M-tile dataset, sharded)
 #   - probe.dataset_roots[name] for each configured probe dataset
 #   - pretrained weights for cfg["model"]["type"] (torch.hub cache)
-# Arrow tiles must already exist. Missing protocol-v2 evaluation datasets
-# are downloaded from their MedARC Hugging Face repository.
+# Missing Arrow tiles and protocol-v2 evaluation datasets are downloaded
+# from their separate MedARC Hugging Face repositories.
 # download_TCGA.sh and prepare_tiles / pack_from_jpeg_dir are only relevant if
 # you want to regenerate the tile dataset from raw SVS files; see README.
 #
@@ -40,6 +40,7 @@ from torchvision.transforms import v2
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+HF_TRAIN_REPO_ID = "medarc/nanopath"
 HF_EVAL_REPO_ID = "medarc/nanopath-evals"
 HF_EVAL_REVISION = "5c8f7848298fa55e09e0bcc58a90a8e9b1c8d426"
 TILE_SIZE = 224
@@ -206,6 +207,7 @@ def _pack_one_shard(args):
 def pack_from_jpeg_dir(jpeg_dir, manifest_path, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = sorted(manifest_path.read_text().splitlines())
+    np.random.default_rng(161803).shuffle(paths)
     chunk_size = (len(paths) + NUM_SHARDS - 1) // NUM_SHARDS
     args_list = [
         (jpeg_dir, paths[i * chunk_size: (i + 1) * chunk_size], out_dir / f"shard-{i:05d}.arrow")
@@ -469,10 +471,15 @@ def main():
     dataset_dir = paths["data.dataset_dir"]
     shards = sorted(dataset_dir.glob("shard-*.arrow"))
 
-    # Stage 1 — tile creation writes Arrow directly; preparation requires these shards.
+    # Stage 1 — download only prepared Arrow tile shards; keep probe files separate.
+    if len(shards) != NUM_SHARDS and download:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=HF_TRAIN_REPO_ID, repo_type="dataset", local_dir=str(dataset_dir),
+                          allow_patterns=["shard-*.arrow"], max_workers=PREPARE_WORKERS)
+        shards = sorted(dataset_dir.glob("shard-*.arrow"))
     assert len(shards) == NUM_SHARDS, (
         f"expected {NUM_SHARDS} Arrow shards under {dataset_dir}. "
-        "Set data.dataset_dir to a prepared Arrow dataset; see README.md for tile creation."
+        f"Set data.dataset_dir to a prepared Arrow dataset or run {prepare_cmd}."
     )
     for shard in shards:
         with pa.memory_map(str(shard), "r") as source:

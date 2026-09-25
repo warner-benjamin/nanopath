@@ -393,6 +393,7 @@ def main():
         "batch_size": batch_size,
         "drop_last": True,
         "num_workers": train_cfg["num_workers"],
+        "multiprocessing_context": "fork" if train_cfg["num_workers"] > 0 else None,
         "pin_memory": True,
         "prefetch_factor": train_cfg["prefetch_factor"] if train_cfg["num_workers"] > 0 else None,
         "persistent_workers": train_cfg["persistent_workers"] and train_cfg["num_workers"] > 0,

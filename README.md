@@ -19,9 +19,8 @@ git clone https://github.com/MedARC-AI/nanopath.git && cd nanopath
 uv sync && source .venv/bin/activate
 wandb login  # or: export WANDB_MODE=offline before launching noninteractive SLURM jobs
 
-# Set data.dataset_dir in both configs to prepared Arrow shards.
-# See "Regenerating the tile dataset from raw SVS" for data creation.
-python prepare.py download=True  # verify tiles, download probes and weights
+# Download prepared Arrow tiles, probe datasets, and model weights.
+python prepare.py download=True
 
 # smoke test: very short training, then probe evals to ensure no errors
 ./submit/train_1gpu.sbatch configs/smoke.yaml
@@ -34,7 +33,7 @@ RUN_DIR=$PWD/data/main/my-run
 # or directly on a GPU machine: python train.py configs/main.yaml output_dir=$RUN_DIR
 ```
 
-`pyproject.toml` pins PyTorch 2.8.0 and torchvision 0.23.0 against the CUDA 12.9 wheel index. By default `uv sync` installs Pillow-SIMD. For Apple Silicon, other ARM CPUs, or x86 CPUs without AVX2, see [Installation](#installation). If your GPU/driver needs a different CUDA build, edit the `torch` and `torchvision` lines in `pyproject.toml` before `uv sync`.
+`pyproject.toml` requires Python 3.14 and pins PyTorch 2.14.0 and torchvision 0.29.0 from the CUDA 13.0 wheel index. By default `uv sync` installs Pillow-SIMD. For Apple Silicon, other ARM CPUs, or x86 CPUs without AVX2, see [Installation](#installation). If your GPU/driver needs a different CUDA build, update both package pins and their `[tool.uv.sources]` index in `pyproject.toml`, then run `uv sync`.
 
 A successful model training prints periodic train lines, appends metrics to `metrics.jsonl`, and writes the final comparison artifact to `summary.json`. `configs/smoke.yaml` is simply meant to pretrain briefly and then run the fixed downstream probe suite to ensure everything works without errors.
 
@@ -192,7 +191,7 @@ On the MedARC cluster, the checked-in `/data` paths are the intended shared defa
 
 **What `download=True` does**
 
-1. **TCGA tiles**: `data.dataset_dir` must contain 200 prepared Arrow shards (~120 GB). Tile creation writes this format directly. The existing [`medarc/nanopath`](https://huggingface.co/datasets/medarc/nanopath) release contains Parquet shards, which this loader does not read.
+1. **TCGA tiles**: `huggingface_hub.snapshot_download` fetches the 200 prepared Arrow shards (~120 GB) from [`medarc/nanopath`](https://huggingface.co/datasets/medarc/nanopath) into `data.dataset_dir`. Downloads include only `shard-*.arrow`. Each row contains `path`, original `jpeg` bytes, and cached `tissue_fraction`.
 2. **Probe datasets**: downloads the exact evaluation snapshot from [`medarc/nanopath-evals`](https://huggingface.co/datasets/medarc/nanopath-evals) into each missing configured root, then verifies every required record.
 3. **DINOv2 backbone weights**: `torch.hub.load_state_dict_from_url` fetches the Meta checkpoint for `model.type` from `dl.fbaipublicfiles.com` into `~/.cache/torch/hub/checkpoints/`.
 
@@ -203,40 +202,9 @@ On the MedARC cluster, the checked-in `/data` paths are the intended shared defa
 
 Our evaluation suite only downloads a small subset of non-test data derived from [THUNDER](https://mics-lab.github.io/thunder/), [PathoBench](https://github.com/mahmoodlab/patho-bench), [LEOPARD](https://leopard.grand-challenge.org/), and [PathoROB](https://arxiv.org/abs/2507.17845). It contains no official THUNDER, HEST, or CPTAC classification test records; HEST is absent entirely, CPTAC appears only in the existing CPTAC-PDA survival development probe, PanNuke Fold3 is absent, and the unused TCGA center is removed from downloadable Tolkach ESCA. See [benchmarking/README.md](benchmarking/README.md) for the precise split contract.
 
-### Arrow tiles and cached tissue fractions
-
-The loader reads uncompressed Arrow IPC files named `shard-NNNNN.arrow`.
-Each row contains `path: string`, original `jpeg: binary` bytes, and non-null `tissue_fraction: float32`.
-Preparation writes one record batch per shard (about 20,000 tiles or 600 MB).
-The reader also supports smaller or unequal batches through cached cumulative row offsets.
-Each worker retains at most 256 readers, with one cached batch per reader.
-Mapped pages consume memory as accessed, but the loader decodes only the selected JPEG.
-
-Tissue fractions measure decoded RGB pixels with saturation greater than 0.07.
-Training rejects candidates from these fractions before reading JPEG bytes.
-The sampling order, rejection RNG, patient split, and dataset length remain unchanged.
-Validation accepts all tiles in its split.
-`data.tissue_thresh` remains adjustable without conversion.
-
-Set `data.dataset_dir` in both configs to the prepared Arrow directory.
-The checked-in configs use `/data/$USER/nanopath/nanopath_arrow`.
-`python prepare.py download=True` verifies these tiles and downloads missing probe data and model weights.
-The one-off migration of existing Parquet data is separate from this repository.
-Original datasets stay unchanged.
-
-Tile creation writes one record batch per shard.
-Each binary column must fit Arrow's 2 GiB offset limit.
-The standard shards fit this limit.
-Each completed shard replaces its destination atomically.
-
-With all performance defaults enabled, three matched H100 subset trials measured 694 → 701 training tiles/s for main Parquet → Arrow.
-The input pipeline, including transfers and GPU augmentation without a model, measured 1,098 → 1,815 tiles/s.
-These warm-cache results used 160,000 tiles, batch 128, and eight workers.
-They show more input capacity, with little change in training throughput.
-
 ### Regenerating the tile dataset from raw SVS
 
-The normal `prepare.py` command verifies prepared Arrow shards. Its tile-creation functions reproduce the dataset from raw SVS files. If you want, however, you can download the full ~13 TB original SVS files from TCGA and pre-extract different tiles to pretrain on. Two-step workflow (decode SVS → JPEG dir + manifest, then pack into Arrow shards):
+`prepare.py` itself never touches raw SVS files—it always pulls the ready-made Arrow shards from Hugging Face. If you want, however, you can download the full ~13 TB original SVS files from TCGA and pre-extract different tiles to pretrain on. Two-step workflow (decode SVS → JPEG dir + manifest, then pack into Arrow shards):
 
 ```bash
 # 1) Download the full 12K open-access TCGA SVS slide set (~13 TB).
