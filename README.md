@@ -221,7 +221,7 @@ from pathlib import Path
 from prepare import prepare_tiles, pack_from_jpeg_dir
 jpeg_dir = Path('/data/$USER/nanopath/nanopath_jpegs_tmp')
 prepare_tiles(Path('/data/TCGA/sample_dataset_30.txt'), jpeg_dir, split_seed=42)
-pack_from_jpeg_dir(jpeg_dir, jpeg_dir / 'manifest.txt', Path('/data/$USER/nanopath/nanopath_arrow'))
+pack_from_jpeg_dir(jpeg_dir, jpeg_dir / 'manifest.txt', Path('/data/nanopath_arrow'))
 "
 ```
 
@@ -264,7 +264,7 @@ uv sync --no-group simd --group pillow
 
 - run outputs: `project.output_dir` (MedARC cluster default `/data/$USER/nanopath/main/...`; auto-localized default `nanopath/data/main/...`). Final probe results log to `metrics.jsonl`.
 - wandb: `project.wandb_dir` (cluster default `/data/$USER/nanopath/wandb`; auto-localized default `nanopath/data/wandb`).
-- Arrow tile shards: `data.dataset_dir` (defaults to `/data/$USER/nanopath/nanopath_arrow`).
+- Arrow tile shards: `data.dataset_dir` (defaults to `/data/nanopath_arrow`).
 - probe datasets: canonical shared `/data/thunder-data`, `/data/surgen`, `/data/leopard_bcr`, `/data/CPTAC-PDA`, `/data/pathorob`, and `/data/ucla-lung` roots declared in `probe.dataset_roots`.
 - DINOv2 backbone weights: `~/.cache/torch/hub/checkpoints/` for the selected `model.type`.
 - SLURM logs: `slurm/<jobid>.{out,err}` in the repo.
